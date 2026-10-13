@@ -6,13 +6,26 @@ on:
 permissions:
   contents: read
 
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
 jobs:
   build-ipa:
+    # Change to macos-26 if your project needs the iOS 26 SDK (Xcode 26).
     runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Get source
         uses: actions/checkout@v4
+
+      - name: Check project.yml exists
+        run: |
+          if [ ! -f project.yml ]; then
+            echo "::error::project.yml not found at the repo root. Commit it, or change --spec below."
+            ls -la
+            exit 1
+          fi
 
       - name: Show Xcode version
         run: xcodebuild -version
@@ -21,7 +34,11 @@ jobs:
         run: brew install xcodegen
 
       - name: Generate Xcode project
-        run: xcodegen generate --spec project.yml
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          # Lists the schemes that exist, which helps if the build step can't find one.
+          xcodebuild -list -project MonkeRAM.xcodeproj
 
       - name: Build unsigned iOS app
         run: |
@@ -36,17 +53,36 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' \
-            build
+            build 2>&1 | tee xcodebuild.log
 
       - name: Package unsigned IPA for Sideloadly
         run: |
           set -euo pipefail
-          APP_PATH='build/Build/Products/Release-iphoneos/MonkeRAM.app'
-          test -d "$APP_PATH"
+          shopt -s nullglob
+          apps=(build/Build/Products/Release-iphoneos/*.app)
+          if [ "${#apps[@]}" -lt 1 ]; then
+            echo "::error::No .app found in build output"
+            find build/Build/Products -maxdepth 2
+            exit 1
+          fi
+          APP_PATH="${apps[0]}"
+          APP_NAME="$(basename "$APP_PATH")"
+          echo "Packaging $APP_NAME"
+
+          # Sanity checks: valid Info.plist, executable present, built for a device
+          plutil -lint "$APP_PATH/Info.plist"
+          EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          test -f "$APP_PATH/$EXEC_NAME"
+          lipo -info "$APP_PATH/$EXEC_NAME"
+          echo "Bundle ID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+
+          rm -rf package MonkeRAM-Sideloadly.ipa
           mkdir -p package/Payload
-          cp -R "$APP_PATH" package/Payload/MonkeRAM.app
-          (cd package && /usr/bin/zip -qry ../MonkeRAM-Sideloadly.ipa Payload)
+          cp -R "$APP_PATH" "package/Payload/$APP_NAME"
+          (cd package && /usr/bin/zip -qry -X ../MonkeRAM-Sideloadly.ipa Payload)
+
           test -s MonkeRAM-Sideloadly.ipa
+          unzip -l MonkeRAM-Sideloadly.ipa | grep "Payload/$APP_NAME/Info.plist"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
@@ -55,3 +91,13 @@ jobs:
           path: MonkeRAM-Sideloadly.ipa
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 3
